@@ -88,235 +88,73 @@ function [outX,outY,outZ,EDOF,CR] = DarkTrack(holoSet,opts,adv)
 % dark-field for holographic 4D particle tracking under Gabor regime." 
 % 2021. Submitted
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-%% Deal with the input
-if nargin < 2
-    error('Not enaugh input arguments ("holoSet" and/or "opts"');
-end
-t = 0; msg = '';
-if ~isfield(opts,'dist'); t=1; msg = ['"dist", ', msg]; end
-if ~isfield(opts,'propRange'); t=1; msg = ['"propRange", ', msg]; end
-if ~isfield(opts,'propStep'); t=1; msg = ['"propStep", ', msg]; end
-if ~isfield(opts,'lambda'); t=1; msg = ['"lambda", ', msg]; end
-if ~isfield(opts,'pixSize'); t=1; msg = ['"pixSize", ', msg]; end
-if ~isfield(opts,'mag'); t=1; msg = ['"mag", ', msg]; end
-if ~isfield(opts,'n0'); opts.n0 = 1; end
-if t == 1; error(['Not enough opts parameters. Missing: ', msg]); end
-if nargin < 3; adv = []; end
-if ~isfield(adv,'minPix'); adv.minPix = 10; end
-if ~isfield(adv,'showTmpRes'); adv.showTmpRes = 1; end
-if ~isfield(adv,'NoF'); adv.NoF = size(holoSet,3); end
-if ~isfield(adv,'backRemov')
-    if size(holoSet,3) <10; adv.backRemov = 2; else; adv.backRemov = 1; end
-end
-if ~isfield(adv,'useGPU'); adv.useGPU = 2; end
-if adv.useGPU == 2
-    try 
-        tmpF = gpuDevice;
-        adv.useGPU = 1;
-    catch
-        adv.useGPU = 0;
-    end
-end
-
-%% Initial processing
-
-% Propagation range
-propRang = opts.dist*1000+opts.propRange(1):opts.propStep:...
-    opts.dist*1000+opts.propRange(2);
-% Pixel size in object plane
-dPix = opts.pixSize/opts.mag;
-
-% Number of frames
-NoF = adv.NoF;
-
-% Size of DarkVolume
-[Sy,Sx,~] = size(holoSet);
-Sz = length(propRang);
-
-% Initializing outputs
-EDOF = zeros(Sy,Sx,NoF);    % Extended depth of focus reconstruction
-CR = zeros(Sy,Sx,NoF);      % Classical darkfield reconstruction
-
-% Calculating hologram background - for all frames
-[t1,t2,t3] = size(adv.backRemov);
-if t3 == 1 % adv.backRemov = single value or 2D array
-    if t1 == 1 && t2 == 1  % adv.backRemov = single value
-        if adv.backRemov == 1   % background = mean image from all frames
-            bckr = mean(holoSet,3);
-            % Pad array to avoid border errors
-            bckr_padded = padarray(bckr,[100,100],0);
-        end
-    elseif t1 == Sy && t2 == Sx % background for all holograms = adv.backRemov 
-        bckr = adv.backRemov;
-        % Pad array to avoid border errors
-        bckr_padded = padarray(bckr,[100,100],0);
-    else
-        error('Wrong adv.backRemov dimensionality (should be equal to holoSet)')
-    end
-end
-
-% x and y coordinates to remove the hologram padding
-yy1 = 101:(100+Sy);
-xx1 = 101:(100+Sx);
-
-% Precomputing the FZ parameter for angular spectrum method (to not compute
-% this multiple times inside the algorithm loop)
-Ny = Sy + 200; % Size of padded hologram
-Nx = Sx + 200;
-dfx = 1/Nx/dPix; % Sampling in x and y
-dfy = 1/Ny/dPix;
-fx=(-Nx/2:Nx/2-1)*dfx;
-fy=(-Ny/2:Ny/2-1)*dfy;
-[FX,FY] = meshgrid(fx,fy); % Spatial frequencies along x and y
-FX = fftshift(FX); FY = fftshift(FY);
-if adv.useGPU == 1
-    FZ = gpuArray(sqrt((opts.n0/opts.lambda).^2-FX.^2-FY.^2));
-else
-    FZ = sqrt((opts.n0/opts.lambda).^2-FX.^2-FY.^2);
-end
-FZ(~isreal(FZ))=0;
-
-%% Loop through all frames
-for tt = 1:NoF
-    %% Calculating the DarkVolume and GradVolume
-    % Processed hologram
-    if adv.useGPU == 1
-        holo = gpuArray(double(holoSet(:,:,tt)));
-    else
-        holo = double(holoSet(:,:,tt));
-    end
-    % Pad array to avoid border errors
-    holo_padded = padarray(holo,[100,100],0);
     
-    % Calculating hologram background (for single frame)
-    if t3 ~=1 || adv.backRemov == 2
-        if adv.backRemov == 2   % Calculate background with gaussian filtering
-            bckr = imgaussfilt(holo,30);
-            % Pad array to avoid border errors
-            bckr_padded = padarray(bckr,[100,100],0);
-        elseif t1 == Sy && t2 == Sx % This hologram background = adv.backRemov(:,:,tt)
-            bckr = adv.backRemov(:,:,tt);
-            % Pad array to avoid border errors
-            bckr_padded = padarray(bckr,[100,100],0);
-        else
-            error('Wrong adv.backRemov dimensionality (should be equal to holoSet)')
-        end
-    end
+    [opts, adv] = validateInputs(holoSet, opts, adv);
     
-    DarkVolume = zeros(Sy,Sx,Sz);
-    GradVolume = zeros(Sy,Sx,Sz);
-    % Darkfield hologram
-    holo_dark = holo_padded - bckr_padded;
-    FTholo_dark = fft2(holo_dark);
+    [propRang, dPix, NoF, Sy, Sx, Sz, bckr_padded, FZ] = initVariables(holoSet, opts, adv);
     
-    % Creating DarkVolume and GradVolume
-    for mm = 1:Sz
-        % Propagate the darkfield hologram at propRang(mm) distance
-        Obj = AS_propagate_optimized(FTholo_dark,propRang(mm),FZ);
-        amp = abs(Obj(yy1,xx1));
-        
-        % Compute CR
-        if mm == round(Sz/2)
-            CR(:,:,tt) = amp;
-            if adv.showTmpRes == 3
-                figure(51); imagesc(amp); colormap gray; axis image
-                title(['Darkfield amplitude; frame = ',num2str(tt),'/',...
-                    num2str(NoF)]); pause(0.01)
-            end
-        end
-        
+    
+    
+    % x and y coordinates to remove the hologram padding
+    yy1 = 101:(100+Sy);
+    xx1 = 101:(100+Sx);
+    
+    t3 = size(adv.backRemov, 3);
+    %% Loop through all frames
+    for tt = 1:NoF
+        %% Calculating the DarkVolume and GradVolume
+        % Processed hologram
         if adv.useGPU == 1
-            DarkVolume(:,:,mm) = gather(amp);
-            [gx, gy] = gradient(amp);
-            GradVolume(:,:,mm) = gather(gx.^2 + gy.^2);
+            holo = gpuArray(double(holoSet(:,:,tt)));
         else
-            DarkVolume(:,:,mm) = amp;
-            [gx, gy] = gradient(amp);
-            GradVolume(:,:,mm) = gx.^2 + gy.^2;
+            holo = double(holoSet(:,:,tt));
         end
-    end
-    
-    %% Binarization and 2D segmentation
-    
-    % Binarized image
-    TB = max(DarkVolume,[],3).*imgaussfilt(max(GradVolume,[],3),4);
-    % Normalizing 0-1
-    im = TB; im = im - min(im(:)); im = im./max(im(:));
-    % Binarization thresholds
-    T1 = adaptthresh(im);
-    T2 = graythresh(im);
-    % Binarizing
-    BW = imbinarize(im,(T1+T2)/2);    
-    % Removing small objects
-    BW = bwareaopen(BW,adv.minPix);
-    % Segmentation
-    [L,ON] = bwlabel(BW);
-    
-    if adv.showTmpRes == 3
-        cmap = [1,1,1;jet(ON)];
-        figure(52); imagesc(L); colormap(cmap); axis image
-        title(['Segmented objects 2D; frame = ',num2str(tt),'/',...
-            num2str(NoF)]); pause(0.01)
-    end
-    
-    %% Calculating objects X,Y,Z position and extended depth of focus image 
-    
-    % Reconstructed frame with EDOF
-    frme2D = zeros(Sy,Sx);
-    % GradVolume maxima maps and their locations in z direction
-    [mks,locs] = max(GradVolume,[],3);
-    
-    % loop through all objects in 2D image
-    for ff = 1:ON
-        % mask the object
-        mask = zeros(size(L));
-        mask(L==ff) = 1;
-        % Take only the 20% of highest mks values (and corresponding locs)
-        v1 = mks(mask~=0);
-        v2 = locs(mask~=0);
-        q = prctile(v1,80);
-        v1T = v1(v1>q);
-        v2T = v2(v1>q);
-        % z location of this object
-        z = sum(v1T.*v2T)/sum(v1T);
-        % (x,y) location of this object
-        m = max(max(DarkVolume(:,:,round(z)).*mask));
-        [y,x] = find(DarkVolume(:,:,round(z)).*mask == m,1);
-        X(ff,tt) = x; Y(ff,tt) = y; Z(ff,tt) = z(1);
-        % Add this object to EDOF image
-        tmp = mask.*DarkVolume(:,:,round(z));
-        frme2D(mask==1) = tmp(mask==1);
-    end
-    EDOF(:,:,tt) = frme2D;
-
-    if adv.showTmpRes > 1
-        figure(53); imagesc(frme2D); colormap gray; axis image
-        title(['Extended depth of focus reconstruction; frame = ',...
-            num2str(tt),'/',num2str(NoF)]); pause(0.01)
-    elseif adv.showTmpRes == 1
-        if mod(tt,10) == 0
-            disp(['DarkTrack; Processed ',num2str(tt),'/',num2str(NoF),' images'])
+        % Pad array to avoid border errors
+        holo_padded = padarray(holo,[100,100],0);
+        
+        % Calculating hologram background (for single frame)
+        if t3 ~=1 || adv.backRemov == 2
+            bckr_padded = createBackground(holo, adv);
         end
+        
+        [DarkVolume, GradVolume, CR(:,:,tt)] = calcDarkAndGradVolume(Sx, Sy, Sz, holo_padded, bckr_padded, propRang, FZ, xx1, yy1, adv, tt);
+        
+        if adv.showTmpRes == 3
+            figure(51); imagesc(CR(:,:, tt)); colormap gray; axis image
+            title(['Darkfield amplitude; frame = ',num2str(tt),'/',...
+                num2str(NoF)]); pause(0.01)
+        end
+    
+        %% Binarization and 2D segmentation
+        
+        img_bin = binarizeImageForSegmentation(DarkVolume, GradVolume, adv);
+    
+        % Segmentation
+        [L,ON] = bwlabel(img_bin);
+        
+        if adv.showTmpRes == 3
+            plotSegmentedObjects(L, ON, tt, NoF);
+        end
+        
+        %% Calculating objects X,Y,Z position and extended depth of focus image 
+        
+        [EDOF(:,:,tt), X(:,tt), Y(:,tt), Z(:,tt)] = reconstructEDOFSingleFrame(GradVolume, DarkVolume, L, ON, Sy, Sx);
+        showTmpRes(adv, EDOF(:,:,tt), tt, NoF)
     end
-end
+    
+    %% final output processing
+    
+    X(X==0) = nan; Y(Y==0) = nan; Z(Z==0) = nan;
+    [X_um, Y_um, Z_um] = convertPositionsToUm(X, Y, Z, dPix, opts);
 
-%% final output processing
-
-X(X==0) = nan; Y(Y==0) = nan; Z(Z==0) = nan;
-
-% convert X,Y,Z to um
-X = X*dPix;
-Y = Y*dPix;
-Z = (Z-1)*opts.propStep + opts.propRange(1);
-
-% 4D segmentation (to associate 
-if NoF > 1
-    [outX,outY,outZ] = Segmentation4D(X,Y,Z);
-else
-    outX = X;
-    outY = Y;
-    outZ = Z;
-end
+    % 4D segmentation (to associate 
+    if NoF > 1
+        [outX,outY,outZ] = Segmentation4D(X_um,Y_um,Z_um);
+    else
+        outX = X_um;
+        outY = Y_um;
+        outZ = Z_um;
+    end
 end
 
 %% Auxiliary functions
@@ -523,3 +361,282 @@ for tt = 2:NoF
     end
 end
 end
+
+function [opts, adv] = validateInputs(holoSet, opts, adv)
+    if nargin < 2
+        error('Not enough input arguments ("holoSet" and/or "opts")');
+    end
+
+    % Validate required fields in opts
+    requiredFields = {'dist', 'propRange', 'propStep', 'lambda', 'pixSize', 'mag'};
+    missingFields = requiredFields(~isfield(opts, requiredFields));
+    
+    if ~isempty(missingFields)
+        error(['Not enough opts parameters. Missing: ', strjoin(missingFields, ', ')]);
+    end
+
+    % Set default value for opts.n0 if not provided
+    if ~isfield(opts, 'n0')
+        opts.n0 = 1;
+    end
+
+    % Set defaults for adv if not provided
+    if nargin < 3
+        adv = struct();
+    end
+
+    advDefaults = struct('minPix', 10, 'showTmpRes', 1, 'NoF', size(holoSet, 3), 'useGPU', 2);
+
+    fields = fieldnames(advDefaults);
+    for i = 1:numel(fields)
+        if ~isfield(adv, fields{i})
+            adv.(fields{i}) = advDefaults.(fields{i});
+        end
+    end
+
+    % Set default for backRemov
+    if ~isfield(adv, 'backRemov')
+        if size(holoSet, 3) < 10
+            adv.backRemov = 2;
+        else
+            adv.backRemov = 1;
+        end
+    end
+
+    % Check GPU usage
+    if adv.useGPU == 2
+        try
+            tmpF = gpuDevice;
+            adv.useGPU = 1;
+        catch
+            adv.useGPU = 0;
+        end
+    end
+end
+
+function [propRang, dPix, NoF, Sy, Sx, Sz, bckr_padded, FZ] = initVariables(holoSet, opts, adv)
+    % Initialize required variables
+    propRang = opts.dist*1000 + opts.propRange(1):opts.propStep:opts.dist*1000 + opts.propRange(2);
+    dPix = opts.pixSize / opts.mag;
+    NoF = adv.NoF;
+
+    % Dimensions of hologram set
+    [Sy, Sx, ~] = size(holoSet);
+    Sz = length(propRang);
+    
+    % Background processing (padding, etc.)
+    bckr_padded = processBackground(holoSet, adv, Sy, Sx);
+
+    FZ = calcFZ(Sx, Sy, dPix, opts, adv);
+end
+
+function bckr_padded = processBackground(holoSet, adv, Sy, Sx)
+    % Calculating hologram background - for all frames
+    [t1,t2,t3] = size(adv.backRemov);
+    if t3 == 1 % adv.backRemov = single value or 2D array
+        if t1 == 1 && t2 == 1  % adv.backRemov = single value
+            if adv.backRemov == 1   % background = mean image from all frames
+                bckr = mean(holoSet,3);
+                % Pad array to avoid border errors
+                bckr_padded = padarray(bckr,[100,100],0);
+            end
+        elseif t1 == Sy && t2 == Sx % background for all holograms = adv.backRemov 
+            bckr = adv.backRemov;
+            % Pad array to avoid border errors
+            bckr_padded = padarray(bckr,[100,100],0);
+        else
+            error('Wrong adv.backRemov dimensionality (should be equal to holoSet)')
+        end
+    end
+end
+
+function FZ = calcFZ(Sx, Sy, dPix, opts, adv)
+    % Precomputing the FZ parameter for angular spectrum method (to not compute
+    % this multiple times inside the algorithm loop)
+    Ny = Sy + 200; % Size of padded hologram
+    Nx = Sx + 200;
+    dfx = 1/Nx/dPix; % Sampling in x and y
+    dfy = 1/Ny/dPix;
+    fx=(-Nx/2:Nx/2-1)*dfx;
+    fy=(-Ny/2:Ny/2-1)*dfy;
+    [FX,FY] = meshgrid(fx,fy); % Spatial frequencies along x and y
+    FX = fftshift(FX); FY = fftshift(FY);
+    if adv.useGPU == 1
+        FZ = gpuArray(sqrt((opts.n0/opts.lambda).^2-FX.^2-FY.^2));
+    else
+        FZ = sqrt((opts.n0/opts.lambda).^2-FX.^2-FY.^2);
+    end
+    FZ(~isreal(FZ))=0;
+end
+
+function bckr_padded = createBackground(holo, adv)
+    if adv.backRemov == 2   % Calculate background with gaussian filtering
+        bckr = imgaussfilt(holo,30);
+    elseif t1 == Sy && t2 == Sx % This hologram background = adv.backRemov(:,:,tt)
+        bckr = adv.backRemov(:,:,tt);
+    else
+        error('Wrong adv.backRemov dimensionality (should be equal to holoSet)')
+    end
+    % Pad array to avoid border errors
+    bckr_padded = padarray(bckr,[100,100],0);
+end
+
+function [DarkVolume, GradVolume, CR] = calcDarkAndGradVolume(Sx, Sy, Sz, holo_padded, bckr_padded, propRang, FZ, xx1, yy1, adv, tt)
+    DarkVolume = zeros(Sy,Sx,Sz);
+    GradVolume = zeros(Sy,Sx,Sz);
+    % Darkfield hologram
+    holo_dark = holo_padded - bckr_padded;
+    FTholo_dark = fft2(holo_dark);
+    
+    % Creating DarkVolume and GradVolume
+    for mm = 1:Sz
+        % Propagate the darkfield hologram at propRang(mm) distance
+        Obj = AS_propagate_optimized(FTholo_dark,propRang(mm),FZ);
+        amp = abs(Obj(yy1,xx1));
+        
+        % Compute CR
+        if mm == round(Sz/2)
+            CR = amp;
+        end
+        
+        if adv.useGPU == 1
+            DarkVolume(:,:,mm) = gather(amp);
+            [gx, gy] = gradient(amp);
+            GradVolume(:,:,mm) = gather(gx.^2 + gy.^2);
+        else
+            DarkVolume(:,:,mm) = amp;
+            [gx, gy] = gradient(amp);
+            GradVolume(:,:,mm) = gx.^2 + gy.^2;
+        end
+
+        if adv.showTmpRes == 3
+            figure(51); imagesc(amp); colormap gray; axis image
+            title(['Darkfield amplitude; frame = ',num2str(tt),'/',...
+                num2str(NoF)]); pause(0.01)
+        end
+    end
+end
+
+function plotSegmentedObjects(L, ON, tt, NoF)
+    % Function to display the segmented objects with a customized colormap
+    %
+    % Inputs:
+    %   L   - The segmented objects 2D matrix
+    %   ON  - The number of segments (used for the jet colormap)
+    %   tt  - The current frame number
+    %   NoF - The total number of frames
+    
+    cmap = [1, 1, 1; jet(ON)];  % Create a colormap with white for background and jet for segments
+    figure(52); 
+    imagesc(L); 
+    colormap(cmap); 
+    axis image;
+    title(['Segmented objects 2D; frame = ', num2str(tt), '/', num2str(NoF)]);
+    pause(0.01);  % Pause for 0.01 seconds
+end
+
+function img_bin = binarizeImageForSegmentation(DarkVolume, GradVolume, adv)
+    % Binarized image
+    TB = max(DarkVolume,[],3).*imgaussfilt(max(GradVolume,[],3),4);
+    % Normalizing 0-1
+    im = TB; im = im - min(im(:)); im = im./max(im(:));
+    % Binarization thresholds
+    T1 = adaptthresh(im);
+    T2 = graythresh(im);
+    % Binarizing
+    img_bin = imbinarize(im,(T1+T2)/2);    
+    % Removing small objects
+    img_bin = bwareaopen(img_bin,adv.minPix);
+end
+
+function showTmpRes(adv, frme2D, tt, NoF)
+    % Function to display extended depth of focus reconstruction or print progress
+    %
+    % Inputs:
+    %   adv    - A structure containing the 'showTmpRes' field
+    %   frme2D - The 2D frame to display for extended depth of focus reconstruction
+    %   tt     - The current frame number
+    %   NoF    - The total number of frames
+    
+    if adv.showTmpRes > 1
+        % Display the extended depth of focus reconstruction
+        figure(53); 
+        imagesc(frme2D); 
+        colormap gray; 
+        axis image;
+        title(['Extended depth of focus reconstruction; frame = ', num2str(tt), '/', num2str(NoF)]);
+        pause(0.01);
+    elseif adv.showTmpRes == 1
+        % Print progress every 10th frame
+        if mod(tt, 10) == 0
+            disp(['DarkTrack; Processed ', num2str(tt), '/', num2str(NoF), ' images']);
+        end
+    end
+end
+
+function [EDOF, X, Y, Z] = reconstructEDOFSingleFrame(GradVolume, DarkVolume, L, ON, Sy, Sx)
+    % Function to reconstruct frame with extended depth of focus (EDOF) for a single frame
+    %
+    % Inputs:
+    %   GradVolume - Gradient volume with maximum values across the z-axis
+    %   DarkVolume - Volume with dark object intensity values
+    %   L          - Label matrix (objects in the 2D image)
+    %   ON         - Total number of objects
+    %   Sy         - Height of the image (number of rows)
+    %   Sx         - Width of the image (number of columns)
+    %
+    % Outputs:
+    %   EDOF      - Reconstructed extended depth of focus frame
+    %   X         - X locations of the objects
+    %   Y         - Y locations of the objects
+    %   Z         - Z locations of the objects
+    
+    % Initialize the reconstructed frame with EDOF
+    EDOF = zeros(Sy, Sx);
+    
+    % GradVolume maxima maps and their locations in the z direction
+    [mks, locs] = max(GradVolume, [], 3);
+    
+    % Initialize vectors for storing object locations
+    X = zeros(ON, 1); % X locations of the objects
+    Y = zeros(ON, 1); % Y locations of the objects
+    Z = zeros(ON, 1); % Z locations of the objects
+    
+    % Loop through all objects in the 2D image
+    for ff = 1:ON
+        % Mask the object
+        mask = zeros(size(L));
+        mask(L == ff) = 1;
+        
+        % Take only the 20% of highest mks values (and corresponding locs)
+        v1 = mks(mask ~= 0);
+        v2 = locs(mask ~= 0);
+        q = prctile(v1, 80);
+        v1T = v1(v1 > q);
+        v2T = v2(v1 > q);
+        
+        % Z location of this object
+        z = sum(v1T .* v2T) / sum(v1T);
+        
+        % (x, y) location of this object
+        m = max(max(DarkVolume(:,:,round(z)) .* mask));
+        [y, x] = find(DarkVolume(:,:,round(z)) .* mask == m, 1);
+        
+        % Store object locations
+        X(ff) = x; 
+        Y(ff) = y; 
+        Z(ff) = z(1);
+        
+        % Add this object to the EDOF image
+        tmp = mask .* DarkVolume(:,:,round(z));
+        EDOF(mask == 1) = tmp(mask == 1);
+    end
+end
+
+function [X_um, Y_um, Z_um] = convertPositionsToUm(X, Y, Z, dPix, opts)
+    % convert X,Y,Z to um
+    X_um = X*dPix;
+    Y_um = Y*dPix;
+    Z_um = (Z-1)*opts.propStep + opts.propRange(1);
+end
+
